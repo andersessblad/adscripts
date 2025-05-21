@@ -1,0 +1,58 @@
+# Import Active Directory module
+Import-Module ActiveDirectory
+
+# Define paths
+$csvPath = "C:\Scripts\users.csv"  # Update with your CSV file path
+$logPath = "C:\Scripts\Disable_Users_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+$targetOU = "OU=Disabled accounts,OU=Users,OU=Resources,DC=corp,DC=com"
+
+# Create log file
+"User Disable and Move Log - $(Get-Date)" | Out-File $logPath
+"----------------------------------------" | Out-File $logPath -Append
+
+try {
+    # Import CSV (expects column header 'sAMAccountName')
+    $users = Import-Csv -Path $csvPath
+    
+    foreach ($user in $users) {
+        $sam = $user.sAMAccountName
+        try {
+            # Get current user info
+            $adUser = Get-ADUser -Identity $sam -Properties DistinguishedName
+            
+            if ($adUser) {
+                # Store original location
+                $originalOU = $adUser.DistinguishedName
+                
+                # Disable account
+                Disable-ADAccount -Identity $sam
+                Write-Host "Disabled account: $sam"
+                
+                # Move to target OU
+                Move-ADObject -Identity $originalOU -TargetPath $targetOU
+                Write-Host "Moved $sam to Disabled Accounts OU"
+                
+                # Log success
+                $logMessage = "$(Get-Date): SUCCESS - Account $sam disabled and moved from $originalOU to $targetOU"
+                $logMessage | Out-File $logPath -Append
+            }
+            else {
+                $logMessage = "$(Get-Date): ERROR - Account $sam not found"
+                $logMessage | Out-File $logPath -Append
+                Write-Host "Account $sam not found"
+            }
+        }
+        catch {
+            $errorMessage = "$(Get-Date): ERROR - Failed to process $sam : $($_.Exception.Message)"
+            $errorMessage | Out-File $logPath -Append
+            Write-Host "Error processing $sam : $($_.Exception.Message)"
+        }
+    }
+}
+catch {
+    $errorMessage = "$(Get-Date): ERROR - Failed to read CSV file: $($_.Exception.Message)"
+    $errorMessage | Out-File $logPath -Append
+    Write-Host "Error reading CSV file: $($_.Exception.Message)"
+}
+
+Write-Host "Script completed. Check log file at $logPath"
