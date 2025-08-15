@@ -1,0 +1,92 @@
+# This script produces a CSV report of directories and their total size, f.ex. for inventory of file servers, home directories etc.
+# Script is using SeBackupPrivilege to bypass eventual run-issues due to insufficient NTFS rights to files and directories during inventory.
+# Review #Config part for customizable options (i.e. report dir + name, and inventory dir start.
+
+# Enable SeBackupPrivilege
+function Enable-Privilege {
+    param([string]$Privilege)
+    $Definition = @"
+using System;
+using System.Runtime.InteropServices;
+public class AdjPriv {
+    [DllImport("advapi32.dll", ExactSpelling=true, SetLastError=true)]
+    internal static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    internal static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out long lpLuid);
+    [DllImport("advapi32.dll", ExactSpelling=true, SetLastError=true)]
+    internal static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges,
+        ref TokPriv1Luid NewState, int BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+    internal const uint TOKEN_ADJUST_PRIVILEGES = 0x20;
+    internal const uint TOKEN_QUERY = 0x8;
+    internal const string SE_BACKUP_NAME = "SeBackupPrivilege";
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal struct TokPriv1Luid {
+        public int Count;
+        public long Luid;
+        public int Attr;
+    }
+    internal const int SE_PRIVILEGE_ENABLED = 0x2;
+    public static bool EnablePrivilege(string privilege) {
+        IntPtr hProc = System.Diagnostics.Process.GetCurrentProcess().Handle;
+        IntPtr hTok;
+        bool retVal = OpenProcessToken(hProc, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out hTok);
+        TokPriv1Luid tp;
+        tp.Count = 1;
+        tp.Luid = 0;
+        tp.Attr = SE_PRIVILEGE_ENABLED;
+        retVal = LookupPrivilegeValue(null, privilege, out tp.Luid);
+        retVal = AdjustTokenPrivileges(hTok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+        return retVal;
+    }
+}
+"@
+    if (-not ("AdjPriv" -as [type])) {
+        Add-Type $Definition
+    }
+    [AdjPriv]::EnablePrivilege($Privilege) | Out-Null
+}
+
+Enable-Privilege "SeBackupPrivilege"
+
+# Config
+$BasePath  = "D:\Directories"
+$OutputCsv = "C:\Temp\DirectorySizes.csv"
+$Throttle  = 8   # number of parallel threads
+
+# Prepare runspaces
+$dirs = Get-ChildItem -Directory -Path $BasePath -Force
+$pool = [runspacefactory]::CreateRunspacePool(1, $Throttle)
+$pool.Open()
+$jobs = @()
+
+foreach ($dir in $dirs) {
+    $ps = [powershell]::Create().AddScript({
+        param($dir)
+        $size = (Get-ChildItem -Path $dir -Recurse -Force -File -ErrorAction SilentlyContinue |
+                 Measure-Object -Property Length -Sum).Sum
+        [PSCustomObject]@{
+            Directory = $dir
+            SizeGB    = [math]::Round($size / 1GB, 2)
+            SizeMB    = [math]::Round($size / 1MB, 2)
+        }
+    }).AddArgument($dir.FullName)
+
+    $ps.RunspacePool = $pool
+    $jobs += [PSCustomObject]@{
+        Pipe = $ps
+        Handle = $ps.BeginInvoke()
+    }
+}
+
+# Collect results
+$results = foreach ($job in $jobs) {
+    $job.Pipe.EndInvoke($job.Handle)
+    $job.Pipe.Dispose()
+}
+
+$pool.Close()
+$pool.Dispose()
+
+# Export
+$results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+Write-Host "Inventory complete. CSV saved to $OutputCsv"
